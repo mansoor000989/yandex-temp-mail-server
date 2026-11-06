@@ -19,9 +19,10 @@ const DATA_FILE = path.join(__dirname, 'data.json');
 app.use(cors()); // CORS open — artifact / frontend kahin se bhi call kar sake
 app.use(express.json({ limit: '1mb' }));
 
-// ---------- Data (memory + data.json) ----------
+// ---------- Data (memory + data.json + env vars) ----------
 // data.json sirf server ke paas rehta hai. Render free par file ephemeral hai,
-// restart par setup kho sakta hai — ye theek hai, owner dobara Setup kar lega.
+// restart par data.json wala setup kho sakta hai — is liye durable setup
+// Render ke env vars (YANDEX_BASE_EMAIL / YANDEX_APP_PASSWORD) se aata hai.
 // Password kabhi kisi response me wapas nahi bhejna.
 let data = { setup: null, aliases: [], messages: {}, seen: [] };
 
@@ -51,6 +52,18 @@ function saveData() {
 
 loadData();
 
+// Env vars (Render dashboard me ek dafa set karo — restart par bhi rehte hain,
+// code me kabhi password nahi likhna):
+//   YANDEX_BASE_EMAIL, YANDEX_APP_PASSWORD
+// Agar env vars set hain to wahi setup use hota hai, data.json wala backup rehta hai.
+const ENV_SETUP = (process.env.YANDEX_BASE_EMAIL && process.env.YANDEX_APP_PASSWORD)
+  ? { baseEmail: String(process.env.YANDEX_BASE_EMAIL).trim().toLowerCase(), appPassword: String(process.env.YANDEX_APP_PASSWORD).trim() }
+  : null;
+
+function effectiveSetup() {
+  return ENV_SETUP || data.setup;
+}
+
 // Purani / expired aliases aur un ki messages saaf karo (60 minute ke baad)
 function pruneExpired() {
   const now = Date.now();
@@ -68,14 +81,16 @@ setInterval(pruneExpired, 5 * 60 * 1000);
 pruneExpired();
 
 function isConfigured() {
-  return !!(data.setup && data.setup.baseEmail && data.setup.appPassword);
+  const s = effectiveSetup();
+  return !!(s && s.baseEmail && s.appPassword);
 }
 
 function publicSetup() {
+  const s = effectiveSetup();
   return {
     configured: isConfigured(),
-    baseEmail: data.setup ? data.setup.baseEmail : null,
-    hasAppPassword: !!(data.setup && data.setup.appPassword),
+    baseEmail: s ? s.baseEmail : null,
+    hasAppPassword: !!(s && s.appPassword),
   };
 }
 
@@ -138,7 +153,7 @@ app.post('/api/alias', (req, res) => {
   let tag = randomTag();
   const used = new Set(data.aliases.map((a) => a.tag));
   while (used.has(tag)) tag = randomTag();
-  const base = data.setup.baseEmail;
+  const base = effectiveSetup().baseEmail;
   const local = base.split('@')[0];
   const address = `${local}+${tag}@yandex.com`;
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
@@ -173,7 +188,7 @@ app.post('/api/sync', async (req, res) => {
     host: 'imap.yandex.com',
     port: 993,
     secure: true,
-    auth: { user: data.setup.baseEmail, pass: data.setup.appPassword },
+    auth: { user: effectiveSetup().baseEmail, pass: effectiveSetup().appPassword },
     logger: false,
   });
 
@@ -273,5 +288,5 @@ app.use('/api', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Yandex Temp Mail server chal raha hai, port ${PORT}`);
-  console.log(`Setup configured: ${isConfigured()}`);
+  console.log(`Setup configured: ${isConfigured()}${ENV_SETUP ? ' (env vars se)' : ''}`);
 });
