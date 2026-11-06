@@ -175,7 +175,33 @@ app.get('/api/alias/:code', (req, res) => {
   res.json(alias);
 });
 
-// POST /api/sync {tag} -> Yandex IMAP se INBOX parho, +tag ke hisab se save karo
+// Spam folder dhoondo — Yandex kabhi kabhi mail ko Spam me daal deta hai.
+// listMailboxes se Junk wala ya naam se Spam wala folder dhoondo, na mile to 'Spam' try karo.
+async function findSpamMailbox(client) {
+  try {
+    const boxes = await client.listMailboxes();
+    const all = [];
+    const walk = (list) => {
+      for (const b of list || []) {
+        all.push(b);
+        if (b.children) walk(b.children);
+      }
+    };
+    walk(boxes);
+    const junk = all.find((b) => {
+      const name = String(b.name || '').toLowerCase();
+      const p = String(b.path || '').toLowerCase();
+      const special = (b.specialUse || []).map((s) => String(s).toLowerCase());
+      return special.some((s) => s.includes('junk')) || name === 'spam' || p === 'spam' || name.includes('spam');
+    });
+    if (junk) return junk.path;
+  } catch (e) {
+    console.log('Mailbox list nahi mili:', e.message);
+  }
+  return 'Spam';
+}
+
+// POST /api/sync {tag} -> Yandex IMAP se INBOX + Spam parho, +tag ke hisab se save karo
 app.post('/api/sync', async (req, res) => {
   const tag = String((req.body && req.body.tag) || '').trim().toLowerCase();
   const totalForTag = () => (data.messages[tag] ? data.messages[tag].length : 0);
@@ -192,62 +218,77 @@ app.post('/api/sync', async (req, res) => {
     logger: false,
   });
 
+  const seenSet = new Set(data.seen);
+
+  // Ek mailbox (INBOX ya Spam) se aakhri 50 mail parho, +tag wali save karo.
+  // folderLabel: 'inbox' ya 'spam' — spam wali mail par Spam nishan lagta hai.
+  async function fetchMailbox(mailboxPath, folderLabel) {
+    const lock = await client.mailboxOpen(mailboxPath);
+    const total = lock.exists || 0;
+    let count = 0;
+    if (total <= 0) return count;
+    // Sirf pehle 50 recent mail parho — purani mail nahi chahiye
+    const from = Math.max(1, total - 49);
+    const range = `${from}:*`;
+
+    for await (const msg of client.fetch(range, { envelope: true, source: true, uid: true })) {
+      try {
+        const parsed = await simpleParser(msg.source);
+        const toAddr = (parsed.to && parsed.to.value && parsed.to.value[0] && parsed.to.value[0].address)
+          || (msg.envelope && msg.envelope.to && msg.envelope.to[0] && msg.envelope.to[0].address)
+          || '';
+        const msgTag = tagFromAddress(toAddr);
+        if (!msgTag) continue; // +tag nahi — ye temp mail nahi hai, skip karo
+
+        const messageId = parsed.messageId || `uid-${msg.uid}`;
+        const key = `${msgTag}:${messageId}`;
+        if (seenSet.has(key)) continue; // pehle se save hai
+
+        const text = parsed.text || '';
+        const html = parsed.html || null;
+        const fromAddr = (parsed.from && parsed.from.value && parsed.from.value[0])
+          ? (parsed.from.value[0].name ? `${parsed.from.value[0].name} <${parsed.from.value[0].address}>` : parsed.from.value[0].address)
+          : (msg.envelope && msg.envelope.from && msg.envelope.from[0] ? msg.envelope.from[0].address : '');
+        const item = {
+          id: key,
+          tag: msgTag,
+          to: toAddr,
+          from: fromAddr,
+          subject: parsed.subject || '(No subject)',
+          date: parsed.date ? new Date(parsed.date).toISOString() : new Date().toISOString(),
+          text,
+          html,
+          otp: extractOtp(text),
+          read: false,
+          uid: msg.uid,
+          folder: folderLabel,
+          spam: folderLabel === 'spam',
+        };
+        if (!data.messages[msgTag]) data.messages[msgTag] = [];
+        data.messages[msgTag].push(item);
+        // Newest first rakho
+        data.messages[msgTag].sort((a, b) => new Date(b.date) - new Date(a.date));
+        seenSet.add(key);
+        data.seen.push(key);
+        if (msgTag === tag) count++;
+      } catch (e) {
+        console.log('Ek mail parse nahi hui, skip:', e.message);
+      }
+    }
+    return count;
+  }
+
   let newCount = 0;
   try {
     await client.connect();
-    const lock = await client.mailboxOpen('INBOX');
-    const total = lock.exists || 0;
-
-    if (total > 0) {
-      // Sirf pehle 50 recent mail parho — purani mail nahi chahiye
-      const from = Math.max(1, total - 49);
-      const range = `${from}:*`;
-      const seenSet = new Set(data.seen);
-      const fetched = [];
-
-      for await (const msg of client.fetch(range, { envelope: true, source: true, uid: true })) {
-        try {
-          const parsed = await simpleParser(msg.source);
-          const toAddr = (parsed.to && parsed.to.value && parsed.to.value[0] && parsed.to.value[0].address)
-            || (msg.envelope && msg.envelope.to && msg.envelope.to[0] && msg.envelope.to[0].address)
-            || '';
-          const msgTag = tagFromAddress(toAddr);
-          if (!msgTag) continue; // +tag nahi — ye temp mail nahi hai, skip karo
-
-          const messageId = parsed.messageId || `uid-${msg.uid}`;
-          const key = `${msgTag}:${messageId}`;
-          if (seenSet.has(key)) continue; // pehle se save hai
-
-          const text = parsed.text || '';
-          const html = parsed.html || null;
-          const fromAddr = (parsed.from && parsed.from.value && parsed.from.value[0])
-            ? (parsed.from.value[0].name ? `${parsed.from.value[0].name} <${parsed.from.value[0].address}>` : parsed.from.value[0].address)
-            : (msg.envelope && msg.envelope.from && msg.envelope.from[0] ? msg.envelope.from[0].address : '');
-          const item = {
-            id: key,
-            tag: msgTag,
-            to: toAddr,
-            from: fromAddr,
-            subject: parsed.subject || '(No subject)',
-            date: parsed.date ? new Date(parsed.date).toISOString() : new Date().toISOString(),
-            text,
-            html,
-            otp: extractOtp(text),
-            read: false,
-            uid: msg.uid,
-          };
-          if (!data.messages[msgTag]) data.messages[msgTag] = [];
-          data.messages[msgTag].push(item);
-          // Newest first rakho
-          data.messages[msgTag].sort((a, b) => new Date(b.date) - new Date(a.date));
-          seenSet.add(key);
-          data.seen.push(key);
-          fetched.push(item);
-          if (msgTag === tag) newCount++;
-        } catch (e) {
-          console.log('Ek mail parse nahi hui, skip:', e.message);
-        }
-      }
+    newCount += await fetchMailbox('INBOX', 'inbox');
+    // Spam folder bhi parho — Yandex kabhi kabhi mail ko spam me daal deta hai.
+    // Spam folder na mile ya error aaye to Inbox wala result phir bhi wapas do.
+    try {
+      const spamPath = await findSpamMailbox(client);
+      if (spamPath) newCount += await fetchMailbox(spamPath, 'spam');
+    } catch (e) {
+      console.log('Spam folder nahi parha ja saka, skip:', e.message);
     }
 
     await client.logout();
