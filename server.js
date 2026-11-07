@@ -1,8 +1,10 @@
-// Yandex Temp Mail Inbox — backend server (Render ke liye)
-// Base email: Man50or1@yandex.com (setup me dala jata hai, code me password kabhi nahi likhna)
-// Har visitor ko alag +tag address milta hai, jaise man50or1+uvhxb6@yandex.com.
-// Sab mail ek hi Yandex inbox me aati hai. Server har mail ke To header se +tag
-// nikal kar us tag wale visitor ko dikhata hai. Yandex ki mail kabhi delete nahi karni,
+// Temp Mail Inbox — backend server (Render ke liye)
+// Providers: Yandex (Man50or1@yandex.com) aur Gmail (mrzacky.tk@gmail.com).
+// Har provider ka apna base email + app password hota hai (env vars se, code me
+// password kabhi nahi likhna). Har visitor ko alag +tag address milta hai, jaise
+// man50or1+uvhxb6@yandex.com ya mrzacky.tk+abc123@gmail.com.
+// Sab mail us provider ke inbox me aati hai. Server har mail ke To header se +tag
+// nikal kar us tag wale visitor ko dikhata hai. Mail kabhi delete nahi karni,
 // sirf read karna hai.
 
 const express = require('express');
@@ -19,10 +21,29 @@ const DATA_FILE = path.join(__dirname, 'data.json');
 app.use(cors()); // CORS open — artifact / frontend kahin se bhi call kar sake
 app.use(express.json({ limit: '1mb' }));
 
+// ---------- Providers ----------
+const PROVIDERS = {
+  yandex: { host: 'imap.yandex.com', domain: 'yandex.com', spamFallback: 'Spam' },
+  gmail: { host: 'imap.gmail.com', domain: 'gmail.com', spamFallback: '[Gmail]/Spam' },
+};
+
+function normProvider(p) {
+  const v = String(p || 'yandex').trim().toLowerCase();
+  return PROVIDERS[v] ? v : 'yandex';
+}
+
+// Messages/aliases ko provider ke hisab se alag rakho:
+// Yandex purani keys waisi hi (tag), Gmail keys 'gmail:tag' se shuru hoti hain.
+function msgKey(provider, tag) {
+  return provider === 'gmail' ? `gmail:${tag}` : tag;
+}
+
 // ---------- Data (memory + data.json + env vars) ----------
 // data.json sirf server ke paas rehta hai. Render free par file ephemeral hai,
 // restart par data.json wala setup kho sakta hai — is liye durable setup
-// Render ke env vars (YANDEX_BASE_EMAIL / YANDEX_APP_PASSWORD) se aata hai.
+// Render ke env vars se aata hai:
+//   Yandex: YANDEX_BASE_EMAIL / YANDEX_APP_PASSWORD
+//   Gmail:  GMAIL_BASE_EMAIL / GMAIL_APP_PASSWORD
 // Password kabhi kisi response me wapas nahi bhejna.
 let data = { setup: null, aliases: [], messages: {}, seen: [] };
 
@@ -54,14 +75,25 @@ loadData();
 
 // Env vars (Render dashboard me ek dafa set karo — restart par bhi rehte hain,
 // code me kabhi password nahi likhna):
-//   YANDEX_BASE_EMAIL, YANDEX_APP_PASSWORD
-// Agar env vars set hain to wahi setup use hota hai, data.json wala backup rehta hai.
 const ENV_SETUP = (process.env.YANDEX_BASE_EMAIL && process.env.YANDEX_APP_PASSWORD)
   ? { baseEmail: String(process.env.YANDEX_BASE_EMAIL).trim().toLowerCase(), appPassword: String(process.env.YANDEX_APP_PASSWORD).trim() }
   : null;
+const GMAIL_ENV_SETUP = (process.env.GMAIL_BASE_EMAIL && process.env.GMAIL_APP_PASSWORD)
+  ? { baseEmail: String(process.env.GMAIL_BASE_EMAIL).trim().toLowerCase(), appPassword: String(process.env.GMAIL_APP_PASSWORD).trim() }
+  : null;
 
-function effectiveSetup() {
-  return ENV_SETUP || data.setup;
+function effectiveSetup(provider) {
+  const p = normProvider(provider);
+  if (p === 'gmail') {
+    if (GMAIL_ENV_SETUP) return GMAIL_ENV_SETUP;
+    if (data.setup && data.setup.gmail) return data.setup.gmail;
+    return null;
+  }
+  if (ENV_SETUP) return ENV_SETUP;
+  if (data.setup && data.setup.yandex) return data.setup.yandex;
+  // Purana single-setup format (sirf Yandex): { baseEmail, appPassword }
+  if (data.setup && data.setup.baseEmail && String(data.setup.baseEmail).endsWith('@yandex.com')) return data.setup;
+  return null;
 }
 
 // Purani / expired aliases aur un ki messages saaf karo (60 minute ke baad)
@@ -70,9 +102,9 @@ function pruneExpired() {
   const before = data.aliases.length;
   data.aliases = data.aliases.filter((a) => new Date(a.expiresAt).getTime() > now);
   if (data.aliases.length !== before) {
-    const live = new Set(data.aliases.map((a) => a.tag));
-    for (const tag of Object.keys(data.messages)) {
-      if (!live.has(tag)) delete data.messages[tag];
+    const live = new Set(data.aliases.map((a) => msgKey(a.provider || 'yandex', a.tag)));
+    for (const key of Object.keys(data.messages)) {
+      if (!live.has(key)) delete data.messages[key];
     }
     saveData();
   }
@@ -80,17 +112,22 @@ function pruneExpired() {
 setInterval(pruneExpired, 5 * 60 * 1000);
 pruneExpired();
 
-function isConfigured() {
-  const s = effectiveSetup();
+function isConfigured(provider) {
+  const s = effectiveSetup(provider);
   return !!(s && s.baseEmail && s.appPassword);
 }
 
 function publicSetup() {
-  const s = effectiveSetup();
+  const y = effectiveSetup('yandex');
+  const g = effectiveSetup('gmail');
   return {
-    configured: isConfigured(),
-    baseEmail: s ? s.baseEmail : null,
-    hasAppPassword: !!(s && s.appPassword),
+    configured: !!(y && y.baseEmail && y.appPassword),
+    baseEmail: y ? y.baseEmail : null,
+    hasAppPassword: !!(y && y.appPassword),
+    providers: {
+      yandex: { configured: !!(y && y.baseEmail && y.appPassword), baseEmail: y ? y.baseEmail : null, hasAppPassword: !!(y && y.appPassword) },
+      gmail: { configured: !!(g && g.baseEmail && g.appPassword), baseEmail: g ? g.baseEmail : null, hasAppPassword: !!(g && g.appPassword) },
+    },
   };
 }
 
@@ -121,63 +158,73 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'yandex-temp-mail-server', setup: publicSetup() });
+  res.json({ ok: true, service: 'temp-mail-server', setup: publicSetup() });
 });
 
-// GET /api/setup -> {configured, baseEmail, hasAppPassword} (password kabhi nahi)
+// GET /api/setup -> per-provider status (password kabhi nahi)
 app.get('/api/setup', (req, res) => {
   res.json(publicSetup());
 });
 
-// POST /api/setup {baseEmail, appPassword} -> save karo
+// POST /api/setup {provider, baseEmail, appPassword} -> save karo
 app.post('/api/setup', (req, res) => {
+  const provider = normProvider(req.body && req.body.provider);
+  const domain = '@' + PROVIDERS[provider].domain;
   const baseEmail = String(req.body && req.body.baseEmail ? req.body.baseEmail : '').trim().toLowerCase();
   const appPassword = String(req.body && req.body.appPassword ? req.body.appPassword : '').trim();
-  if (!baseEmail || !baseEmail.includes('@') || !baseEmail.endsWith('@yandex.com')) {
-    return res.status(400).json({ error: 'Sahi Yandex base email dalo, jaise man50or1@yandex.com' });
+  if (!baseEmail || !baseEmail.includes('@') || !baseEmail.endsWith(domain)) {
+    return res.status(400).json({ error: `Sahi ${provider === 'gmail' ? 'Gmail' : 'Yandex'} base email dalo, jaise ${provider === 'gmail' ? 'mrzacky.tk@gmail.com' : 'man50or1@yandex.com'}` });
   }
   if (!appPassword) {
-    return res.status(400).json({ error: 'App password dalo — ye Yandex login password nahi, App Password hota hai' });
+    return res.status(400).json({ error: 'App password dalo — ye login password nahi, App Password hota hai' });
   }
-  data.setup = { baseEmail, appPassword };
+  // Purana single-setup format ho to us ko yandex ke neeche le aao
+  if (data.setup && data.setup.baseEmail) {
+    data.setup = { yandex: { baseEmail: data.setup.baseEmail, appPassword: data.setup.appPassword } };
+  }
+  if (!data.setup || typeof data.setup !== 'object') data.setup = {};
+  data.setup[provider] = { baseEmail, appPassword };
   saveData();
-  res.json({ configured: true, baseEmail, hasAppPassword: true });
+  res.json({ ...publicSetup(), provider });
 });
 
-// POST /api/alias -> naya random 6-char tag, 60-min expiry
+// POST /api/alias {provider} -> naya random 6-char tag, 60-min expiry
 app.post('/api/alias', (req, res) => {
-  if (!isConfigured()) {
-    return res.status(400).json({ error: 'Pehle Setup me apna Yandex base email dalo' });
+  const provider = normProvider((req.body && req.body.provider) || (req.query && req.query.provider));
+  if (!isConfigured(provider)) {
+    return res.status(400).json({ error: provider === 'gmail' ? 'Pehle Gmail setup karo (base email + app password)' : 'Pehle Setup me apna Yandex base email dalo' });
   }
   pruneExpired();
   let tag = randomTag();
-  const used = new Set(data.aliases.map((a) => a.tag));
+  const used = new Set(data.aliases.filter((a) => (a.provider || 'yandex') === provider).map((a) => a.tag));
   while (used.has(tag)) tag = randomTag();
-  const base = effectiveSetup().baseEmail;
+  const base = effectiveSetup(provider).baseEmail;
   const local = base.split('@')[0];
-  const address = `${local}+${tag}@yandex.com`;
+  const address = `${local}+${tag}@${PROVIDERS[provider].domain}`;
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-  const alias = { address, tag, code: tag, expiresAt, createdAt: new Date().toISOString() };
+  const alias = { address, tag, code: tag, expiresAt, createdAt: new Date().toISOString(), provider };
   data.aliases.push(alias);
-  if (!data.messages[tag]) data.messages[tag] = [];
+  const key = msgKey(provider, tag);
+  if (!data.messages[key]) data.messages[key] = [];
   saveData();
   res.json(alias);
 });
 
-// GET /api/alias/:code -> alias dhoondo, na mile to 404
+// GET /api/alias/:code?provider=gmail -> alias dhoondo, na mile to 404
 app.get('/api/alias/:code', (req, res) => {
   pruneExpired();
+  const provider = normProvider(req.query && req.query.provider);
   const code = String(req.params.code || '').trim().toLowerCase();
-  const alias = data.aliases.find((a) => a.tag === code);
+  const alias = data.aliases.find((a) => a.tag === code && (a.provider || 'yandex') === provider);
   if (!alias) {
     return res.status(404).json({ error: 'Is code par koi address nahi mila' });
   }
   res.json(alias);
 });
 
-// Spam folder dhoondo — Yandex kabhi kabhi mail ko Spam me daal deta hai.
-// listMailboxes se Junk wala ya naam se Spam wala folder dhoondo, na mile to 'Spam' try karo.
-async function findSpamMailbox(client) {
+// Spam folder dhoondo — provider kabhi kabhi mail ko Spam me daal deta hai.
+// listMailboxes se Junk wala ya naam se Spam wala folder dhoondo, na mile to fallback try karo.
+async function findSpamMailbox(client, fallback) {
   try {
     const boxes = await client.listMailboxes();
     const all = [];
@@ -198,23 +245,26 @@ async function findSpamMailbox(client) {
   } catch (e) {
     console.log('Mailbox list nahi mili:', e.message);
   }
-  return 'Spam';
+  return fallback;
 }
 
-// POST /api/sync {tag} -> Yandex IMAP se INBOX + Spam parho, +tag ke hisab se save karo
+// POST /api/sync {tag, provider} -> provider ke IMAP se INBOX + Spam parho, +tag ke hisab se save karo
 app.post('/api/sync', async (req, res) => {
+  const provider = normProvider((req.body && req.body.provider) || (req.query && req.query.provider));
   const tag = String((req.body && req.body.tag) || '').trim().toLowerCase();
-  const totalForTag = () => (data.messages[tag] ? data.messages[tag].length : 0);
+  const key = msgKey(provider, tag);
+  const totalForTag = () => (data.messages[key] ? data.messages[key].length : 0);
 
-  if (!isConfigured()) {
-    return res.json({ status: 'no_credentials', newCount: 0, total: totalForTag(), error: 'Pehle Setup me apna Yandex base email aur app password dalo' });
+  if (!isConfigured(provider)) {
+    return res.json({ status: 'no_credentials', newCount: 0, total: totalForTag(), error: provider === 'gmail' ? 'Pehle Gmail setup karo (base email + app password)' : 'Pehle Setup me apna Yandex base email aur app password dalo' });
   }
 
+  const setup = effectiveSetup(provider);
   const client = new ImapFlow({
-    host: 'imap.yandex.com',
+    host: PROVIDERS[provider].host,
     port: 993,
     secure: true,
-    auth: { user: effectiveSetup().baseEmail, pass: effectiveSetup().appPassword },
+    auth: { user: setup.baseEmail, pass: setup.appPassword },
     logger: false,
   });
 
@@ -241,8 +291,8 @@ app.post('/api/sync', async (req, res) => {
         if (!msgTag) continue; // +tag nahi — ye temp mail nahi hai, skip karo
 
         const messageId = parsed.messageId || `uid-${msg.uid}`;
-        const key = `${msgTag}:${messageId}`;
-        if (seenSet.has(key)) continue; // pehle se save hai
+        const dedupeKey = provider === 'gmail' ? `gmail:${msgTag}:${messageId}` : `${msgTag}:${messageId}`;
+        if (seenSet.has(dedupeKey)) continue; // pehle se save hai
 
         const text = parsed.text || '';
         const html = parsed.html || null;
@@ -250,8 +300,9 @@ app.post('/api/sync', async (req, res) => {
           ? (parsed.from.value[0].name ? `${parsed.from.value[0].name} <${parsed.from.value[0].address}>` : parsed.from.value[0].address)
           : (msg.envelope && msg.envelope.from && msg.envelope.from[0] ? msg.envelope.from[0].address : '');
         const item = {
-          id: key,
+          id: dedupeKey,
           tag: msgTag,
+          provider,
           to: toAddr,
           from: fromAddr,
           subject: parsed.subject || '(No subject)',
@@ -264,12 +315,13 @@ app.post('/api/sync', async (req, res) => {
           folder: folderLabel,
           spam: folderLabel === 'spam',
         };
-        if (!data.messages[msgTag]) data.messages[msgTag] = [];
-        data.messages[msgTag].push(item);
+        const storeKey = msgKey(provider, msgTag);
+        if (!data.messages[storeKey]) data.messages[storeKey] = [];
+        data.messages[storeKey].push(item);
         // Newest first rakho
-        data.messages[msgTag].sort((a, b) => new Date(b.date) - new Date(a.date));
-        seenSet.add(key);
-        data.seen.push(key);
+        data.messages[storeKey].sort((a, b) => new Date(b.date) - new Date(a.date));
+        seenSet.add(dedupeKey);
+        data.seen.push(dedupeKey);
         if (msgTag === tag) count++;
       } catch (e) {
         console.log('Ek mail parse nahi hui, skip:', e.message);
@@ -282,10 +334,10 @@ app.post('/api/sync', async (req, res) => {
   try {
     await client.connect();
     newCount += await fetchMailbox('INBOX', 'inbox');
-    // Spam folder bhi parho — Yandex kabhi kabhi mail ko spam me daal deta hai.
+    // Spam folder bhi parho — provider kabhi kabhi mail ko spam me daal deta hai.
     // Spam folder na mile ya error aaye to Inbox wala result phir bhi wapas do.
     try {
-      const spamPath = await findSpamMailbox(client);
+      const spamPath = await findSpamMailbox(client, PROVIDERS[provider].spamFallback);
       if (spamPath) newCount += await fetchMailbox(spamPath, 'spam');
     } catch (e) {
       console.log('Spam folder nahi parha ja saka, skip:', e.message);
@@ -301,18 +353,20 @@ app.post('/api/sync', async (req, res) => {
   }
 });
 
-// GET /api/messages/:tag -> us tag ki mail list, newest first
+// GET /api/messages/:tag?provider=gmail -> us tag ki mail list, newest first
 app.get('/api/messages/:tag', (req, res) => {
+  const provider = normProvider(req.query && req.query.provider);
   const tag = String(req.params.tag || '').trim().toLowerCase();
-  const list = (data.messages[tag] || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date));
-  res.json({ tag, messages: list, total: list.length });
+  const list = (data.messages[msgKey(provider, tag)] || []).slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+  res.json({ tag, provider, messages: list, total: list.length });
 });
 
-// GET /api/message/:tag/:id -> ek mail ka full body, read mark karo
+// GET /api/message/:tag/:id?provider=gmail -> ek mail ka full body, read mark karo
 app.get('/api/message/:tag/:id', (req, res) => {
+  const provider = normProvider(req.query && req.query.provider);
   const tag = String(req.params.tag || '').trim().toLowerCase();
   const id = decodeURIComponent(String(req.params.id || ''));
-  const list = data.messages[tag] || [];
+  const list = data.messages[msgKey(provider, tag)] || [];
   const msg = list.find((m) => m.id === id);
   if (!msg) {
     return res.status(404).json({ error: 'Mail nahi mili' });
@@ -328,6 +382,6 @@ app.use('/api', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Yandex Temp Mail server chal raha hai, port ${PORT}`);
-  console.log(`Setup configured: ${isConfigured()}${ENV_SETUP ? ' (env vars se)' : ''}`);
+  console.log(`Temp Mail server chal raha hai, port ${PORT}`);
+  console.log(`Setup — Yandex: ${isConfigured('yandex')}${ENV_SETUP ? ' (env vars se)' : ''}, Gmail: ${isConfigured('gmail')}${GMAIL_ENV_SETUP ? ' (env vars se)' : ''}`);
 });
